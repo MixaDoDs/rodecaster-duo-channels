@@ -39,11 +39,15 @@ ${C_B}Использование:${C_0}
   $0 install [опции]   поставить конфиги PipeWire/WirePlumber
   $0 uninstall         удалить конфиги, поставленные этим скриптом
   $0 status            показать виртуальные устройства и маршруты Discord
+  $0 music [ГРОМКОСТЬ] громкость музыки, которую слышат в Discord
+                       (50%, +5%, -3dB; без аргумента — показать текущую)
   $0 test              проверить изоляцию mix-minus тестовым тоном (нужен python3)
 
 ${C_B}Опции install:${C_0}
   --default-mic chatmic|mainmix|keep
                        микрофон по умолчанию (по умолчанию: chatmic)
+  --music-level V      громкость музыки для Discord
+                       (по умолчанию 50%, если её ещё не меняли)
   --latency N          node.latency = N/48000 для всех петель (по умолчанию не задаётся)
   --no-restart         только записать файлы, звук не перезапускать
   --dry-run            показать, что будет записано, ничего не меняя
@@ -382,12 +386,13 @@ set_default() {  # set_default sink|source <имя>
 
 # ── команды ──────────────────────────────────────────────────────────────────
 cmd_install() {
-    local default_mic="chatmic" restart=1
+    local default_mic="chatmic" restart=1 music_level=""
     while (($#)); do
         case "$1" in
             --default-mic) default_mic=${2:?}; shift ;;
             --latency)     LATENCY=${2:?}; shift
                            [[ "$LATENCY" =~ ^[0-9]+$ ]] || die "--latency ждёт число, например 256" ;;
+            --music-level) music_level=${2:?}; shift ;;
             --no-restart)  restart=0 ;;
             --dry-run)     DRY_RUN=1 ;;
             -h|--help)     usage; exit 0 ;;
@@ -422,6 +427,13 @@ cmd_install() {
         esac
         ok "выход по умолчанию: $(pactl get-default-sink)"
         ok "микрофон по умолчанию: $(pactl get-default-source)"
+        wait_for 10 music_stream_id || die "не найден поток rode_mm_music"
+        # Уже подобранную громкость не трогаем: 50% только для нетронутой (100%).
+        if [[ -z "$music_level" && "$(music_volume)" == 100%* ]]; then
+            music_level="50%"
+        fi
+        [[ -n "$music_level" ]] && set_music_volume "$music_level"
+        ok "музыка для Discord: $(music_volume) — менять: $0 music 40%"
     else
         info "перезапусти звук сам: systemctl --user restart pipewire pipewire-pulse wireplumber"
     fi
@@ -466,12 +478,47 @@ describe_one() {  # describe_one sources|sinks <name>
     pactl list "$1" | awk -v want="$2" '/^\tName:/{n=$2} /^\tDescription:/ && n==want {sub(/^\tDescription: /,""); print; found=1; exit} END{if(!found) print want}'
 }
 
+# ── громкость музыки в mix-minus ─────────────────────────────────────────────
+# Дорожка музыки в Multitrack снимается до фейдера, поэтому фейдер пульта
+# на неё не влияет — громкость для собеседников задаётся здесь.
+# WirePlumber запоминает её и восстанавливает после перезапуска.
+music_stream_id() {
+    local id
+    id=$(pactl list sink-inputs | awk '/^Sink Input #/{id=substr($3,2)} /node.name = "rode_mm_music"/{print id; exit}')
+    [[ -n "$id" ]] && echo "$id"
+}
+
+music_volume() {
+    pactl list sink-inputs | awk -v id="$(music_stream_id)" '
+        /^Sink Input #/{cur=substr($3,2)}
+        cur==id && /^\tVolume:/{printf "%s (%s дБ)\n", $5, $7; exit}'
+}
+
+set_music_volume() {
+    local v=$1 id
+    [[ "$v" =~ ^[+-]?[0-9]+(\.[0-9]+)?(%|dB)?$ ]] || die "громкость: 50%, +5%, -5%, -3dB или 0.5"
+    id=$(music_stream_id) || die "поток rode_mm_music не найден — сначала $0 install"
+    pactl set-sink-input-volume "$id" "$v"
+}
+
+cmd_music() {
+    need pactl "pipewire-pulse"
+    music_stream_id >/dev/null || die "поток rode_mm_music не найден — сначала $0 install"
+    if (($#)); then
+        set_music_volume "$1"
+        ok "музыка для Discord: $(music_volume)"
+    else
+        echo "музыка для Discord: $(music_volume)"
+    fi
+}
+
 cmd_status() {
     need pactl "pipewire-pulse"
     printf '%sВходы:%s\n' "$C_B" "$C_0"
     describe sources
     printf '%sВыходы:%s\n' "$C_B" "$C_0"
     describe sinks
+    printf '%sМузыка для Discord:%s %s\n' "$C_B" "$C_0" "$(music_volume)"
     printf '%sПо умолчанию:%s\n  выход     %s\n  микрофон  %s\n' "$C_B" "$C_0" \
         "$(describe_one sinks "$(pactl get-default-sink)")" \
         "$(describe_one sources "$(pactl get-default-source)")"
@@ -568,6 +615,7 @@ main() {
         install)         cmd_install "$@" ;;
         uninstall)       cmd_uninstall ;;
         status)          cmd_status ;;
+        music)           cmd_music "$@" ;;
         test)            cmd_test ;;
         -v|--version)    echo "$VERSION" ;;
         ""|-h|--help|help) usage ;;
